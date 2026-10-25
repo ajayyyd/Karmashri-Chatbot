@@ -1,0 +1,39 @@
+# Explicitly excluded project directories
+go_ingest/
+GO/
+qdrant_storage/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python compiled bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+src/__pycache__/
+src/temp/
+.pytest_cache/
+
+# Local databases & storage
+pgdata/
+*.sqlite3
+
+# PDF data directories (ignore all files except .gitkeep)
+data/pdf/*
+!data/pdf/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/dead_letter/*
+!data/dead_letter/.gitkeep
+
+# Environment secrets
+.env
+.env.local
+
+# Operating system & IDE junk
+.DS_Store
+.vscode/
+.idea/
+.~lock.*#

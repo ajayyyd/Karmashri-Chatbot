@@ -1,0 +1,23 @@
+# --- Web API & Serving ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+pydantic>=2.6.0
+requests>=2.31.0
+
+# --- Vector & Relational Storage ---
+qdrant-client>=1.8.0
+psycopg[binary]>=3.1.18
+
+# --- Embeddings & Deep Learning ---
+# RTX 50-series (Blackwell) requires PyTorch with CUDA 12.4+ / 12.8+
+torch>=2.4.0
+sentence-transformers>=3.0.0
+
+# --- Document Parsing & Text Processing ---
+pymupdf>=1.24.0
+pytesseract>=0.3.10
+Pillow>=10.2.0
+
+# --- Scientific & Utilities ---
+numpy>=1.26.0
+tqdm>=4.66.0

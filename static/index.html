@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Karmashri: Legal Verification & Ground-Truth Audit</title>
+  <style>
+    :root {
+      --primary: #004d40;
+      --accent: #00796b;
+      --bg: #eceff1;
+      --card: #ffffff;
+      --border: #cfd8dc;
+      --text: #263238;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: var(--primary);
+      color: white;
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .badge {
+      background: rgba(255,255,255,0.2);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+    }
+    .workspace {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+    .left-pane {
+      width: 50%;
+      border-right: 2px solid var(--border);
+      padding: 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+    .right-pane {
+      width: 50%;
+      background: #546e7a;
+      display: flex;
+      flex-direction: column;
+    }
+    .search-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 15px;
+    }
+    textarea {
+      width: 100%;
+      height: 65px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 0.95rem;
+      resize: vertical;
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+      align-items: center;
+    }
+    select, button {
+      padding: 8px 14px;
+      border-radius: 4px;
+      font-size: 0.9rem;
+    }
+    button {
+      background: var(--primary);
+      color: white;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { background: var(--accent); }
+    .answer-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 18px;
+      line-height: 1.6;
+      display: none;
+    }
+    .answer-text {
+      white-space: pre-wrap;
+      font-size: 0.95rem;
+    }
+    .citations-list {
+      margin-top: 15px;
+      border-top: 1px dashed var(--border);
+      padding-top: 12px;
+    }
+    .cite-btn {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: #f1f8e9;
+      border: 1px solid #c8e6c9;
+      color: #1b5e20;
+      padding: 8px 12px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      line-height: 1.4;
+    }
+    .cite-btn:hover {
+      background: #dcedc8;
+      border-color: #aed581;
+    }
+    .viewer-header {
+      background: #37474f;
+      color: white;
+      padding: 8px 16px;
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+    }
+    iframe {
+      width: 100%;
+      flex: 1;
+      border: none;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <strong>KARMASHRI</strong> &mdash; Legal Ground-Truth Audit Workbench
+  </div>
+  <span class="badge">Kerala Secretariat Ingestion Verifier</span>
+</header>
+
+<div class="workspace">
+  <!-- Left Side: Queries and Grounded Synthesis -->
+  <div class="left-pane">
+    <div class="search-card">
+      <textarea id="queryInput" placeholder="Enter test query (e.g., 'What is the ceiling and distance for hostel subsidy?')"></textarea>
+      <div class="controls">
+        <select id="deptSelect">
+          <option value="">All Departments</option>
+          <option value="GAD">GAD (General Administration)</option>
+          <option value="FIN">FIN (Finance Department)</option>
+          <option value="H&FWD">H&FWD (Health & Family Welfare)</option>
+        </select>
+        <button onclick="executeVerificationQuery()">Audit Query</button>
+        <span id="statusIndicator" style="display:none; color: var(--accent); font-weight: 600;">Searching &amp; Verifying...</span>
+      </div>
+    </div>
+
+    <div class="answer-card" id="answerCard">
+      <div class="answer-text" id="answerText"></div>
+      
+      <div class="citations-list">
+        <strong style="font-size: 0.85rem; text-transform: uppercase; color: #546e7a;">
+          Source Invariant Citations (Click to load PDF):
+        </strong>
+        <div id="citationButtons" style="margin-top: 8px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right Side: Real-time Embedded Original PDF Viewer -->
+  <div class="right-pane">
+    <div class="viewer-header">
+      <span id="activeDocLabel">Source Document Viewer</span>
+      <span id="activeClauseLabel">Select a verified citation to inspect</span>
+    </div>
+    <iframe id="pdfFrame" src="about:blank"></iframe>
+  </div>
+</div>
+
+<script>
+async function executeVerificationQuery() {
+  const query = document.getElementById('queryInput').value.trim();
+  const dept = document.getElementById('deptSelect').value;
+  if (!query) return;
+
+  const status = document.getElementById('statusIndicator');
+  const card = document.getElementById('answerCard');
+  status.style.display = 'inline';
+  card.style.display = 'none';
+
+  let url = `/api/v1/query?q=${encodeURIComponent(query)}&top_k=4`;
+  if (dept) url += `&department=${encodeURIComponent(dept)}`;
+
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+
+    document.getElementById('answerText').innerText = data.answer;
+    const btnContainer = document.getElementById('citationButtons');
+    btnContainer.innerHTML = '';
+
+    data.citations.forEach((c) => {
+      const btn = document.createElement('button');
+      btn.className = 'cite-btn';
+      btn.innerHTML = `<strong>[${c.source_index}] ${c.go_number}</strong> (dt. ${c.date})<br>
+                       Path: <code>${c.parent_path}</code> | File: <em>${c.source_file || 'View Document'}</em>`;
+      
+      btn.onclick = () => {
+        if (c.source_file) {
+          document.getElementById('activeDocLabel').innerText = c.go_number + " (" + c.date + ")";
+          document.getElementById('activeClauseLabel').innerText = "Clause Path: " + c.parent_path;
+          document.getElementById('pdfFrame').src = `/api/v1/pdf/${encodeURIComponent(c.source_file)}`;
+        } else {
+          alert("Source filename metadata is missing for this node.");
+        }
+      };
+
+      btnContainer.appendChild(btn);
+    });
+
+    card.style.display = 'block';
+
+    // Auto-load the first cited source PDF into the viewer
+    if (data.citations.length > 0 && data.citations[0].source_file) {
+      const first = data.citations[0];
+      document.getElementById('activeDocLabel').innerText = first.go_number + " (" + first.date + ")";
+      document.getElementById('activeClauseLabel').innerText = "Clause Path: " + first.parent_path;
+      document.getElementById('pdfFrame').src = `/api/v1/pdf/${encodeURIComponent(first.source_file)}`;
+    }
+
+  } catch (err) {
+    alert("Query failed: " + err);
+  } finally {
+    status.style.display = 'none';
+  }
+}
+</script>
+
+</body>
+</html>
