@@ -129,7 +129,7 @@ class SafeTextNormalizer:
 # ============================================================
 
 class HybridKeralaGOMetadataExtractor:
-    # Captures: G.O.(Ms) No. 68/2026/GAD, G.O.(Rt) No. 12/09/FIN, G.O.(P) No.45/2024/SCSTDD
+    # Captures GO numbers: eg, G.O.(Ms) No. 68/2026/GAD, G.O.(Rt) No. 12/09/FIN, G.O.(P) No.45/2024/SCSTDD
     GO_NUMBER_RE = re.compile(
         r'G[\.0O\s]*\(?\s*([A-Za-z]+)\s*\)?[\.0O\s]*N[o00]{1,2}[\.:\s]*'
         r'(\d+)[ \t\.]*[\/\-\\|lI1][ \t\.]*(\d{2,4})[ \t\.]*[\/\-\\|lI1][ \t\.]*'
@@ -138,9 +138,12 @@ class HybridKeralaGOMetadataExtractor:
     )
 
     DATE_RE = re.compile(
-        r'(?:Dated|Date)[\s,:]*(?:Thiruvananthapuram[,\s]*)?'
-        r'(\d{1,2}[/\.\-]\d{1,2}[/\.\-]\d{2,4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+[,\s]+\d{4})',
-        re.IGNORECASE
+    r'(?:Dated|Date)\s*[:,]?\s*'
+    r'(?:[A-Za-z ]+,\s*)?'
+    r'(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}'
+    r'|\d{1,2}(?:st|nd|rd|th)?\s+'
+    r'[A-Za-z]+\s*,?\s+\d{4})',
+    re.IGNORECASE
     )
 
     CITED_ORDERS_RE = re.compile(
@@ -170,6 +173,21 @@ class HybridKeralaGOMetadataExtractor:
         return cls._canonicalize_metadata(meta, filename_hint)
 
     @classmethod
+    def _derive_department_from_go(cls, go_number: str) -> Tuple[Optional[str], Optional[str]]:
+        """Derives dept_code and department cleanly from an already parsed go_number."""
+        if not go_number:
+            return None, None
+
+        parts = [p.strip() for p in go_number.split('/')]
+        dept_code = None
+        if len(parts) >= 3:
+            # Clean trailing punctuation or whitespace from the last token
+            dept_code = re.sub(r'[^A-Z&]', '', parts[-1].upper())
+
+        department_name = KERALA_DEPARTMENTS.get(dept_code, dept_code if dept_code else None)
+        return dept_code, department_name
+
+    @classmethod
     def _extract_regex(cls, header_text: str, filename_hint: str) -> Dict[str, Any]:
         meta: Dict[str, Any] = {
             "go_type": None,
@@ -185,12 +203,16 @@ class HybridKeralaGOMetadataExtractor:
             order_seq = go_m.group(2).strip()
             order_year = cls._expand_year(go_m.group(3).strip())
             raw_dept = "".join(go_m.group(4).split())
-            dept_code = re.sub(r'(?:GOVERNMENT|DATED|DATE|ABSTRACT|\bDT\b).*$', '', raw_dept, flags=re.IGNORECASE).rstrip('/-_ ')
+            clean_dept = re.sub(r'(?:GOVERNMENT|DATED|DATE|ABSTRACT|\bDT\b).*$', '', raw_dept, flags=re.IGNORECASE).rstrip('/-_ ')
+            
+            # Form initial GO number to leverage clean derivation
+            temp_go_number = f"G.O.({raw_type}) No. {order_seq}/{order_year}/{clean_dept}"
+            dept_code, department = cls._derive_department_from_go(temp_go_number)
 
             meta["go_type"] = raw_type
             meta["dept_code"] = dept_code
-            meta["go_number"] = f"G.O.({raw_type}) No. {order_seq}/{order_year}/{dept_code}"
-            meta["department"] = KERALA_DEPARTMENTS.get(dept_code)
+            meta["go_number"] = temp_go_number
+            meta["department"] = department
 
         d_m = cls.DATE_RE.search(header_text)
         if d_m:
@@ -228,6 +250,11 @@ class HybridKeralaGOMetadataExtractor:
                 payload = res.json().get("response", "{}")
                 data = json.loads(payload)
                 if isinstance(data, dict):
+                    # Also normalize fields derived from LLM response go_number if present
+                    if data.get("go_number"):
+                        d_code, d_name = cls._derive_department_from_go(data["go_number"])
+                        if d_code:
+                            data["dept_code"] = d_code
                     return data
         except Exception as exc:
             log.warning(f"Ollama local inference failed: {exc}")
@@ -242,7 +269,6 @@ class HybridKeralaGOMetadataExtractor:
         if not go_num or go_num.lower() == "null":
             return False
 
-        # Extract alphanumeric sequence
         target_tokens = "".join(c for c in go_num if c.isalnum()).upper()
         header_tokens = "".join(c for c in header_text if c.isalnum()).upper()
         file_tokens = "".join(c for c in filename_hint if c.isalnum()).upper()
@@ -250,13 +276,11 @@ class HybridKeralaGOMetadataExtractor:
         if target_tokens in header_tokens:
             return True
 
-        # Fuzzy match against filename hint
         ratio = difflib.SequenceMatcher(None, target_tokens, file_tokens).ratio()
         return ratio >= 0.75
 
     @classmethod
     def _canonicalize_metadata(cls, meta: Dict[str, Any], filename_hint: str) -> Dict[str, Any]:
-        # Cross-validate against filename if still unresolved
         if not meta.get("go_number") and filename_hint:
             fn_m = cls.GO_NUMBER_RE.search(filename_hint)
             if fn_m:
@@ -264,19 +288,24 @@ class HybridKeralaGOMetadataExtractor:
                 seq = fn_m.group(2)
                 yr = cls._expand_year(fn_m.group(3))
                 code = "".join(fn_m.group(4).split())
-                meta["go_type"] = raw_type
-                meta["dept_code"] = code
                 meta["go_number"] = f"G.O.({raw_type}) No. {seq}/{yr}/{code}"
-                meta["department"] = KERALA_DEPARTMENTS.get(code)
+                meta["go_type"] = raw_type
 
         if not meta.get("order_date_iso") and filename_hint:
             d_m = cls.DATE_RE.search(filename_hint)
             if d_m:
                 meta["order_date_iso"] = cls._parse_iso_date(d_m.group(1).strip())
 
-        # Ensure uniform capitalization
+        # Clean trailing noise on go_number
         if meta.get("go_number"):
             meta["go_number"] = re.sub(r'(?:dt|dated|\bdt\b).*$', '', meta["go_number"], flags=re.IGNORECASE).rstrip('/-_ ')
+            
+            # Ensure dept_code and department are always structurally derived from go_number
+            dept_code, department = cls._derive_department_from_go(meta["go_number"])
+            if dept_code:
+                meta["dept_code"] = dept_code
+            if department:
+                meta["department"] = department
 
         return meta
 
@@ -312,8 +341,13 @@ class HybridKeralaGOMetadataExtractor:
         for k in ["go_type", "go_number", "order_date_iso", "dept_code"]:
             if not primary.get(k) and secondary.get(k):
                 primary[k] = secondary[k]
-        if not primary.get("department") and primary.get("dept_code"):
-            primary["department"] = KERALA_DEPARTMENTS.get(primary["dept_code"])
+        
+        if primary.get("go_number"):
+            d_code, d_name = HybridKeralaGOMetadataExtractor._derive_department_from_go(primary["go_number"])
+            if d_code:
+                primary["dept_code"] = d_code
+            if d_name:
+                primary["department"] = d_name
         return primary
 
 
@@ -460,7 +494,6 @@ class KeralaLegalClauseParser(NodeParser):
             return [self._build_node(text, meta, section, "Intro", "Intro", go_id)]
 
         slices: List[Tuple[int, int, Any]] = []
-        # Leading chunk before the first clause marker
         if matches[0].start() > 0:
             slices.append((0, matches[0].start(), None))
 
@@ -510,7 +543,6 @@ class KeralaLegalClauseParser(NodeParser):
         path: str,
         go_id: str
     ) -> TextNode:
-        # Generate idempotent SHA-256 identifier
         seed = f"{go_id}::{section}::{path}::{text.strip()}".encode('utf-8')
         node_id = hashlib.sha256(seed).hexdigest()
 
@@ -541,7 +573,6 @@ class KeralaLegalClauseParser(NodeParser):
 # ============================================================
 
 def assert_complete_text_coverage(source_text: str, nodes: List[BaseNode]) -> None:
-    """Verifies that 100% of the substantive text from the PDF was partitioned into nodes."""
     def strip_ws(t: str) -> str:
         return "".join(c for c in unicodedata.normalize('NFC', t) if not c.isspace())
 
@@ -557,7 +588,6 @@ def assert_complete_text_coverage(source_text: str, nodes: List[BaseNode]) -> No
 
 
 def extract_page_data(page: pymupdf.Page) -> Tuple[str, str]:
-    # 1. Structure preservation: Extract tables as Markdown first
     tab_finder = page.find_tables()
     table_bboxes = []
     table_md_chunks = []
@@ -567,16 +597,13 @@ def extract_page_data(page: pymupdf.Page) -> Tuple[str, str]:
             table_bboxes.append(tab.bbox)
             table_md_chunks.append(tab.to_markdown())
 
-    # 2. Extract plain text layer
     raw_digital = page.get_text("text").strip()
     score = SafeTextNormalizer.evaluate_quality(raw_digital)
 
     if score >= MIN_TEXT_QUALITY_SCORE:
-        # If valid tables exist, append them cleanly to preserve structured data
         full_text = raw_digital + ("\n\n" + "\n\n".join(table_md_chunks) if table_md_chunks else "")
         return full_text, "digital"
 
-    # 3. Direct memory OCR fallback using grayscale conversion (no disk/PNG overhead)
     pix = page.get_pixmap(matrix=pymupdf.Matrix(ZOOM, ZOOM), colorspace=pymupdf.csGRAY)
     img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
@@ -616,7 +643,6 @@ def ingest_kerala_go_pdf(pdf_path: Path) -> List[BaseNode]:
     parser = KeralaLegalClauseParser()
     nodes = parser.get_nodes_from_documents([parent_doc])
 
-    # Enforce non-destructive invariant
     assert_complete_text_coverage(full_text, nodes)
     log.info(f"Zero text-loss verified. Emitted {len(nodes)} hierarchical nodes.")
     return nodes
