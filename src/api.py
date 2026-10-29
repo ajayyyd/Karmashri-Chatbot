@@ -4,7 +4,7 @@ FastAPI Statewide Service Endpoint for Karmashri Legal AI.
 
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 # Ensure project root is available on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +47,8 @@ class QueryResponse(BaseModel):
     query: str
     answer: str
     citations: List[CitationModel]
+    # Added retrieved_chunks to send raw Qdrant/PostgreSQL nodes to the UI debugger
+    retrieved_chunks: Optional[List[Dict[str, Any]]] = None
 
 
 # Mount static assets directory
@@ -85,6 +87,7 @@ def execute_query(
     top_k: int = Query(4, ge=1, le=10, description="Number of source clauses to synthesize")
 ):
     try:
+        # result must now include "retrieved_chunks" to populate the debugger
         result = advisor.answer_query(q, dept_code=department, top_k=top_k)
         return result
     except Exception as exc:

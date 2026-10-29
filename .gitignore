@@ -1,7 +1,6 @@
-# Explicitly excluded project directories
+# Directories you explicitly want to exclude
 go_ingest/
 GO/
-qdrant_storage/
 
 # Virtual Environment
 venv/
@@ -13,10 +12,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 src/__pycache__/
-src/temp/
+src/temp/__pycache__/
 .pytest_cache/
 
-# Local databases & storage
+# Scratch & experimental test scripts
+src/temp/
+
+# Large binaries, local database engines & vector storage
+qdrant_storage/
 pgdata/
 *.sqlite3
 
@@ -36,4 +39,3 @@ data/dead_letter/*
 .DS_Store
 .vscode/
 .idea/
-.~lock.*#

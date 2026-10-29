@@ -1,8 +1,8 @@
 """
 Statewide Hybrid Retrieval Engine for Karmashri.
 Combines Qdrant (Dense Vector Search) + PostgreSQL (Sparse Full-Text Search)
-via Reciprocal Rank Fusion (RRF) with Temporal Recency Precedence,
-Source File Metadata tracking, and Parent Context Assembly.
+via Reciprocal Rank Fusion (RRF).
+Adds Native Cross-Encoder Reranking for entity precision, followed by Temporal Recency Precedence.
 """
 
 import os
@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import psycopg
 from psycopg.rows import dict_row
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
 
@@ -40,7 +40,10 @@ class KarmashriHybridRetriever:
     def __init__(self, rrf_k: int = 60):
         self.rrf_k = rrf_k
         self.qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        
+        log.info("Loading Embeddings and Cross-Encoder into VRAM...")
         self.embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+        self.reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
 
     def _get_pg_conn(self):
         return psycopg.connect(
@@ -60,16 +63,17 @@ class KarmashriHybridRetriever:
         top_k: int = 4,
         fetch_parent_context: bool = True
     ) -> List[Dict[str, Any]]:
-        """
-        Executes hybrid dense + sparse retrieval with Reciprocal Rank Fusion
-        and temporal amendment re-weighting.
-        """
+        
         # ----------------------------------------------------
         # 1. Dense Semantic Search via Qdrant
         # ----------------------------------------------------
         query_vector = self.embed_model.encode(query, normalize_embeddings=True).tolist()
 
         must_conditions = []
+        must_not_conditions = [
+            FieldCondition(key="parent_path", match=MatchValue(value="Endorsement"))
+        ]
+
         if dept_code:
             must_conditions.append(
                 FieldCondition(key="dept_code", match=MatchValue(value=dept_code))
@@ -79,13 +83,15 @@ class KarmashriHybridRetriever:
                 FieldCondition(key="order_date", range=Range(gte=date_from))
             )
 
-        qdrant_filter = Filter(must=must_conditions) if must_conditions else None
+        qdrant_filter = Filter(must=must_conditions, must_not=must_not_conditions)
 
+        search_limit = max(15, top_k * 3)
+        
         dense_hits = self.qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
             query=query_vector,
             query_filter=qdrant_filter,
-            limit=top_k * 3
+            limit=search_limit
         ).points
 
         dense_ranks: Dict[str, int] = {}
@@ -101,11 +107,13 @@ class KarmashriHybridRetriever:
         sparse_ranks: Dict[str, int] = {}
         sparse_rows: Dict[str, Dict[str, Any]] = {}
 
-        # Sanitize query string for plainto_tsquery
         clean_query = re.sub(r'[^\w\s\.-]', ' ', query).strip()
 
-        pg_filter_clauses = ["to_tsvector('english', n.text) @@ plainto_tsquery('english', %(query)s)"]
-        pg_params: Dict[str, Any] = {"query": clean_query, "limit": top_k * 3}
+        pg_filter_clauses = [
+            "to_tsvector('english', n.text) @@ plainto_tsquery('english', %(query)s)",
+            "n.parent_path != 'Endorsement'"
+        ]
+        pg_params: Dict[str, Any] = {"query": clean_query, "limit": search_limit}
 
         if dept_code:
             pg_filter_clauses.append("d.dept_code = %(dept)s")
@@ -148,7 +156,7 @@ class KarmashriHybridRetriever:
             log.warning(f"PostgreSQL sparse FTS execution skipped: {exc}")
 
         # ----------------------------------------------------
-        # 3. Reciprocal Rank Fusion (RRF) with Temporal Recency Boost
+        # 3. Reciprocal Rank Fusion (RRF) Broad Candidate Pool
         # ----------------------------------------------------
         all_ids = set(dense_ranks.keys()).union(set(sparse_ranks.keys()))
         fused_scores: List[Tuple[str, float]] = []
@@ -159,43 +167,49 @@ class KarmashriHybridRetriever:
                 score += 1.0 / (self.rrf_k + dense_ranks[node_id])
             if node_id in sparse_ranks:
                 score += 1.0 / (self.rrf_k + sparse_ranks[node_id])
-
-            # Extract order date for temporal precedence
-            date_str = None
-            if node_id in sparse_rows:
-                date_str = str(sparse_rows[node_id].get("order_date", ""))
-            elif node_id in dense_payloads:
-                date_str = str(dense_payloads[node_id].get("order_date", ""))
-
-            # Apply temporal multipliers so recent amendments (2025/2026) outrank older base rules
-            if date_str and len(date_str) >= 4:
-                try:
-                    year = int(date_str[:4])
-                    if year >= 2025:
-                        score *= 1.30  # Active recent amendments prioritized
-                    elif year >= 2023:
-                        score *= 1.15
-                except ValueError:
-                    pass
-
             fused_scores.append((node_id, score))
 
-        # Sort highest fused score first
         fused_scores.sort(key=lambda x: x[1], reverse=True)
-        top_fused = fused_scores[:top_k]
+        candidates = fused_scores[:search_limit]
 
         # ----------------------------------------------------
-        # 4. Construct Final Response Payload
+        # 4. Native Cross-Encoder Reranking & Temporal Boost
+        # ----------------------------------------------------
+        candidate_texts = []
+        for node_id, _ in candidates:
+            if node_id in sparse_rows:
+                candidate_texts.append(sparse_rows[node_id]["text"])
+            else:
+                candidate_texts.append(dense_payloads[node_id].get("text", ""))
+
+        final_ranked_ids: List[Tuple[str, float]] = []
+
+        if candidate_texts:
+            sentence_pairs = [[query, text] for text in candidate_texts]
+            cross_scores = self.reranker.predict(sentence_pairs)
+
+            for idx, base_score in enumerate(cross_scores):
+                node_id = candidates[idx][0]
+                final_ranked_ids.append((node_id, float(base_score)))
+            
+            final_ranked_ids.sort(key=lambda x: x[1], reverse=True)
+        else:
+            final_ranked_ids = self._apply_temporal_boost(candidates, sparse_rows, dense_payloads)
+
+        top_final = final_ranked_ids[:top_k]
+
+        # ----------------------------------------------------
+        # 5. Construct Final Response Payload
         # ----------------------------------------------------
         results: List[Dict[str, Any]] = []
-        for node_id, rrf_score in top_fused:
+        for node_id, final_score in top_final:
             record: Dict[str, Any] = {}
 
             if node_id in sparse_rows:
                 row = sparse_rows[node_id]
                 record = {
                     "node_id": node_id,
-                    "rrf_score": rrf_score,
+                    "rrf_score": final_score,
                     "go_number": row["go_number"],
                     "department": row["department"],
                     "date": str(row["order_date"]),
@@ -209,7 +223,7 @@ class KarmashriHybridRetriever:
                 pl = dense_payloads[node_id]
                 record = {
                     "node_id": node_id,
-                    "rrf_score": rrf_score,
+                    "rrf_score": final_score,
                     "go_number": pl.get("go_number"),
                     "department": pl.get("department"),
                     "date": str(pl.get("order_date")),
@@ -220,11 +234,9 @@ class KarmashriHybridRetriever:
                     "text": pl.get("text")
                 }
 
-            # If source_file was missing from payload, backfill from Postgres
             if record and not record.get("source_file"):
                 record["source_file"] = self._lookup_source_file(record["go_number"])
 
-            # 5. Fetch full parent context if requested
             if record and fetch_parent_context:
                 record["full_parent_context"] = self._get_parent_context(
                     go_number=record["go_number"],
@@ -236,8 +248,29 @@ class KarmashriHybridRetriever:
 
         return results
 
+    def _apply_temporal_boost(self, candidates, sparse_rows, dense_payloads) -> List[Tuple[str, float]]:
+        boosted = []
+        for node_id, score in candidates:
+            date_str = None
+            if node_id in sparse_rows:
+                date_str = str(sparse_rows[node_id].get("order_date", ""))
+            elif node_id in dense_payloads:
+                date_str = str(dense_payloads[node_id].get("order_date", ""))
+
+            if date_str and len(date_str) >= 4:
+                try:
+                    year = int(date_str[:4])
+                    if year >= 2025:
+                        score *= 1.30
+                    elif year >= 2023:
+                        score *= 1.15
+                except ValueError:
+                    pass
+            boosted.append((node_id, score))
+        boosted.sort(key=lambda x: x[1], reverse=True)
+        return boosted
+
     def _lookup_source_file(self, go_number: str) -> Optional[str]:
-        """Backfills source_file directly from kerala_go_documents table."""
         sql = "SELECT source_file FROM kerala_go_documents WHERE go_number = %(go_number)s LIMIT 1;"
         try:
             with self._get_pg_conn() as conn:
@@ -251,10 +284,6 @@ class KarmashriHybridRetriever:
         return None
 
     def _get_parent_context(self, go_number: str, parent_path: str) -> Optional[str]:
-        """
-        Retrieves sibling sub-clauses when an atomic leaf node (e.g. 3 > (b)) matches,
-        ensuring operative rules have their entire section context intact.
-        """
         if not parent_path or parent_path in {"Preamble", "Endorsement", "Intro"}:
             return None
 
@@ -279,24 +308,3 @@ class KarmashriHybridRetriever:
         except Exception:
             pass
         return None
-
-
-if __name__ == "__main__":
-    retriever = KarmashriHybridRetriever()
-
-    test_queries = [
-        "What is the reimbursement ceiling and distance condition for Hostel Subsidy?",
-        "rates of children education allowance for differently abled children",
-        "private hospital definition under AIS medical facilities scheme"
-    ]
-
-    for q in test_queries:
-        print("\n" + "=" * 90)
-        print(f"QUERY: {q}")
-        print("=" * 90)
-        hits = retriever.search(q, top_k=2)
-        for i, hit in enumerate(hits, start=1):
-            print(f"\n[Hit {i} | RRF Score: {hit['rrf_score']:.5f}]")
-            print(f"Order: {hit['go_number']} | Date: {hit['date']} | File: {hit.get('source_file')}")
-            print(f"Path: {hit['parent_path']}")
-            print(f"Snippet: {hit['text'][:220]}...")

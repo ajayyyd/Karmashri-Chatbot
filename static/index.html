@@ -137,6 +137,68 @@
       flex: 1;
       border: none;
     }
+    
+    /* Retrieval Debugger Styles */
+    .debug-panel {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background-color: #f8fafc;
+      margin-top: 5px;
+      display: none;
+      flex-direction: column;
+      max-height: 400px;
+    }
+    .debug-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 15px;
+      background-color: #e2e8f0;
+      border-top-left-radius: 6px;
+      border-top-right-radius: 6px;
+      font-family: monospace;
+    }
+    .debug-header h3 { margin: 0; font-size: 13px; color: #334155; }
+    .debug-content {
+      padding: 15px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .chunk-card {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      padding: 10px;
+      margin-bottom: 10px;
+      border-radius: 4px;
+    }
+    .chunk-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 15px;
+      color: #475569;
+      margin-bottom: 8px;
+      font-weight: bold;
+    }
+    .score-badge {
+      background: #dbeafe;
+      color: #1e40af;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .chunk-text {
+      color: #1e293b;
+      white-space: pre-wrap;
+      border-left: 3px solid #94a3b8;
+      padding-left: 10px;
+      margin: 0;
+    }
+    #toggle-debug-btn {
+      background: #64748b;
+      padding: 4px 8px;
+      font-size: 11px;
+    }
+    #toggle-debug-btn:hover { background: #475569; }
   </style>
 </head>
 <body>
@@ -175,6 +237,17 @@
         <div id="citationButtons" style="margin-top: 8px;"></div>
       </div>
     </div>
+
+    <!-- Retrieval Debugger Panel -->
+    <div id="retrieval-debugger" class="debug-panel">
+      <div class="debug-header">
+          <h3>🔍 Retrieved Qdrant Nodes (<span id="chunk-count">0</span>)</h3>
+          <button onclick="toggleDebugger()" id="toggle-debug-btn">Hide</button>
+      </div>
+      <div id="debug-chunks-container" class="debug-content">
+          <p style="color: #64748b;">Waiting for query...</p>
+      </div>
+    </div>
   </div>
 
   <!-- Right Side: Real-time Embedded Original PDF Viewer -->
@@ -188,6 +261,49 @@
 </div>
 
 <script>
+function toggleDebugger() {
+  const container = document.getElementById('debug-chunks-container');
+  const btn = document.getElementById('toggle-debug-btn');
+  if (container.style.display === 'none') {
+    container.style.display = 'block';
+    btn.innerText = 'Hide';
+  } else {
+    container.style.display = 'none';
+    btn.innerText = 'Show';
+  }
+}
+
+function renderRetrievedChunks(chunks) {
+  const container = document.getElementById('debug-chunks-container');
+  const countSpan = document.getElementById('chunk-count');
+  
+  countSpan.innerText = chunks.length;
+  container.innerHTML = ''; 
+
+  if (chunks.length === 0) {
+    container.innerHTML = '<p style="color: #64748b;">No chunks retrieved.</p>';
+    return;
+  }
+
+  chunks.forEach((chunk, index) => {
+    const score = chunk.rrf_score !== undefined ? chunk.rrf_score.toFixed(4) : (chunk.score !== undefined ? chunk.score.toFixed(4) : "N/A");
+    const goNumber = chunk.go_number || "Unknown GO";
+    const parentPath = chunk.parent_path || "Root";
+
+    const card = document.createElement('div');
+    card.className = 'chunk-card';
+    card.innerHTML = `
+        <div class="chunk-meta">
+            <span class="score-badge">#${index + 1} | Score: ${score}</span>
+            <span>GO: ${goNumber}</span>
+            <span>Path: ${parentPath}</span>
+        </div>
+        <div class="chunk-text">${chunk.text}</div>
+    `;
+    container.appendChild(card);
+  });
+}
+
 async function executeVerificationQuery() {
   const query = document.getElementById('queryInput').value.trim();
   const dept = document.getElementById('deptSelect').value;
@@ -195,8 +311,11 @@ async function executeVerificationQuery() {
 
   const status = document.getElementById('statusIndicator');
   const card = document.getElementById('answerCard');
+  const debuggerPanel = document.getElementById('retrieval-debugger');
+  
   status.style.display = 'inline';
   card.style.display = 'none';
+  debuggerPanel.style.display = 'none';
 
   let url = `/api/v1/query?q=${encodeURIComponent(query)}&top_k=4`;
   if (dept) url += `&department=${encodeURIComponent(dept)}`;
@@ -205,33 +324,44 @@ async function executeVerificationQuery() {
     const res = await fetch(url);
     const data = await res.json();
 
-    document.getElementById('answerText').innerText = data.answer;
+    // Populate LLM Answer
+    document.getElementById('answerText').innerText = data.answer || "No answer generated.";
+    
+    // Populate Citations
     const btnContainer = document.getElementById('citationButtons');
     btnContainer.innerHTML = '';
+    
+    if (data.citations) {
+      data.citations.forEach((c) => {
+        const btn = document.createElement('button');
+        btn.className = 'cite-btn';
+        btn.innerHTML = `<strong>[${c.source_index}] ${c.go_number}</strong> (dt. ${c.date})<br>
+                         Path: <code>${c.parent_path}</code> | File: <em>${c.source_file || 'View Document'}</em>`;
+        
+        btn.onclick = () => {
+          if (c.source_file) {
+            document.getElementById('activeDocLabel').innerText = c.go_number + " (" + c.date + ")";
+            document.getElementById('activeClauseLabel').innerText = "Clause Path: " + c.parent_path;
+            document.getElementById('pdfFrame').src = `/api/v1/pdf/${encodeURIComponent(c.source_file)}`;
+          } else {
+            alert("Source filename metadata is missing for this node.");
+          }
+        };
 
-    data.citations.forEach((c) => {
-      const btn = document.createElement('button');
-      btn.className = 'cite-btn';
-      btn.innerHTML = `<strong>[${c.source_index}] ${c.go_number}</strong> (dt. ${c.date})<br>
-                       Path: <code>${c.parent_path}</code> | File: <em>${c.source_file || 'View Document'}</em>`;
-      
-      btn.onclick = () => {
-        if (c.source_file) {
-          document.getElementById('activeDocLabel').innerText = c.go_number + " (" + c.date + ")";
-          document.getElementById('activeClauseLabel').innerText = "Clause Path: " + c.parent_path;
-          document.getElementById('pdfFrame').src = `/api/v1/pdf/${encodeURIComponent(c.source_file)}`;
-        } else {
-          alert("Source filename metadata is missing for this node.");
-        }
-      };
-
-      btnContainer.appendChild(btn);
-    });
+        btnContainer.appendChild(btn);
+      });
+    }
 
     card.style.display = 'block';
 
+    // Populate Retrieval Debugger
+    if (data.retrieved_chunks) {
+      debuggerPanel.style.display = 'flex';
+      renderRetrievedChunks(data.retrieved_chunks);
+    }
+
     // Auto-load the first cited source PDF into the viewer
-    if (data.citations.length > 0 && data.citations[0].source_file) {
+    if (data.citations && data.citations.length > 0 && data.citations[0].source_file) {
       const first = data.citations[0];
       document.getElementById('activeDocLabel').innerText = first.go_number + " (" + first.date + ")";
       document.getElementById('activeClauseLabel').innerText = "Clause Path: " + first.parent_path;
