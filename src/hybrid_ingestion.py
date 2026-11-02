@@ -228,6 +228,7 @@ class HybridKeralaGOMetadataExtractor:
         cleaned = [" ".join(m.split()) for m in matches]
         return list(dict.fromkeys(cleaned))
 
+
     @classmethod
     def _extract_via_local_llm(cls, header_window: str) -> Dict[str, Any]:
         prompt = (
@@ -387,6 +388,47 @@ class KeralaLegalClauseParser(NodeParser):
         rf')[ \t]+',
         re.IGNORECASE | re.MULTILINE
     )
+    
+    @staticmethod
+    def detect_statutory_form(text: str, current_section: str) -> str:
+        text_lower = text.lower()
+        
+        # 1. Visual Artifacts (The most reliable metric in bad OCR)
+        # Look for 3 or more dots, underscores, or dashed lines
+        blank_lines_count = len(re.findall(r"\.{3,}|_{3,}|(?:-\s*){4,}", text))
+        
+        # 2. Form Vocabulary Point System (Accounts for partial OCR matches)
+        form_score = 0
+        if "signature" in text_lower or "sign & seal" in text_lower: form_score += 2
+        if "designation" in text_lower: form_score += 1
+        if "office seal" in text_lower or "(seal)" in text_lower: form_score += 1
+        if "name of" in text_lower: form_score += 1
+        if "date:" in text_lower or "date :" in text_lower: form_score += 1
+        if "applicant" in text_lower: form_score += 1
+        if "bill no" in text_lower or "rupees" in text_lower: form_score += 1
+        
+        # 3. Explicit Title Fallbacks (If OCR actually got it right)
+        has_title = False
+        if "essentiality certificate" in text_lower or "application for" in text_lower:
+            has_title = True
+        # Fuzzy match for Form-I, Form-II, etc.
+        if re.search(r"\bform[- \w]{1,5}[ivx\d]+", text_lower):
+            has_title = True
+
+        # DECISION TREE
+        # Extreme blanks (4+) = Form (even if OCR completely ruined every single word)
+        if blank_lines_count >= 4:
+            return "statutory_form"
+            
+        # High blanks (2+) + At least one form field recognized
+        if blank_lines_count >= 2 and form_score >= 1:
+            return "statutory_form"
+            
+        # Explicit Title + At least one form field or blank
+        if has_title and (blank_lines_count >= 1 or form_score >= 1):
+            return "statutory_form"
+            
+        return current_section
 
     def _parse_nodes(
         self,
@@ -411,10 +453,12 @@ class KeralaLegalClauseParser(NodeParser):
                 post_preamble_slice = text
 
             if preamble_slice:
+                # Apply form detection to preamble
+                final_section = self.detect_statutory_form(preamble_slice, "preamble")
                 nodes.append(self._build_node(
                     text=preamble_slice,
                     meta=meta,
-                    section="preamble",
+                    section=final_section,
                     marker="Preamble",
                     path="Preamble",
                     go_id=go_id
@@ -461,13 +505,17 @@ class KeralaLegalClauseParser(NodeParser):
                     for idx, start_idx in enumerate(form_splits):
                         end_idx = form_splits[idx + 1] if idx + 1 < len(form_splits) else len(annexure_body)
                         form_slice = annexure_body[start_idx:end_idx]
+                        
+                        # Explicitly label this block as a statutory_form without further chunking
+                        final_section = self.detect_statutory_form(form_slice, "statutory_form")
+                        
                         tag = self.FORM_HEADING.search(form_slice)
                         marker_val = tag.group(0).strip() if tag else f"Form-{idx+1}"
 
                         nodes.append(self._build_node(
                             text=form_slice,
                             meta=meta,
-                            section="statutory_form",
+                            section=final_section,
                             marker=marker_val,
                             path=f"Annexure > {marker_val}",
                             go_id=go_id
@@ -489,9 +537,12 @@ class KeralaLegalClauseParser(NodeParser):
             return []
 
         nodes: List[TextNode] = []
+        
         matches = list(self.CLAUSE_PATTERN.finditer(text))
         if not matches:
-            return [self._build_node(text, meta, section, "Intro", "Intro", go_id)]
+            # Safely evaluate if this un-chunked block is a form
+            final_section = self.detect_statutory_form(text, section)
+            return [self._build_node(text, meta, final_section, "Intro", "Intro", go_id)]
 
         slices: List[Tuple[int, int, Any]] = []
         if matches[0].start() > 0:
@@ -508,6 +559,9 @@ class KeralaLegalClauseParser(NodeParser):
             chunk = text[start:end]
             if not chunk:
                 continue
+                
+            # Intercept inner chunk: Evaluate ONLY this specific sub-clause
+            chunk_section = self.detect_statutory_form(chunk, section)
 
             if match_obj is None:
                 marker = "Intro"
@@ -530,7 +584,7 @@ class KeralaLegalClauseParser(NodeParser):
 
                 path_str = " > ".join(path_stack) if path_stack else marker
 
-            nodes.append(self._build_node(chunk, meta, section, marker, path_str, go_id))
+            nodes.append(self._build_node(chunk, meta, chunk_section, marker, path_str, go_id))
 
         return nodes
 

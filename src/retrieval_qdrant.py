@@ -6,6 +6,7 @@ Adds Native Cross-Encoder Reranking for entity precision, followed by Temporal R
 """
 
 import os
+import requests
 import re
 import logging
 from typing import List, Dict, Any, Optional, Tuple
@@ -55,6 +56,39 @@ class KarmashriHybridRetriever:
             row_factory=dict_row
         )
 
+    def expand_query_with_llm(self,query: str) -> str:
+        """Uses the local LLM to dynamically generate search keywords based on query intent."""
+        endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate")
+        model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+        
+        prompt = f"""You are a search query expansion assistant for Kerala Government Orders.
+            Analyze the user's query and generate 5 to 7 highly relevant official keywords, synonyms, or bureaucratic terms (e.g., procedure, eligibility, submission, statutory, allowance) to help a database retrieve the correct legal clauses.
+
+            User Query: {query}
+
+            MANDATORY: Output ONLY the expanded keywords separated by spaces. Do not write sentences. Do not include the original query words."""
+
+        try:
+            response = requests.post(endpoint, json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.0,
+                "num_predict": 20 # Keep it extremely fast
+            }, timeout=20)
+            
+            if response.status_code == 200:
+                llm_keywords = response.json().get("response", "").strip()
+                # Clean out any accidental punctuation the LLM might generate
+                llm_keywords = re.sub(r'[^\w\s]', '', llm_keywords)
+                return f"{query} {llm_keywords}"
+                
+        except Exception as e:
+            import logging
+            logging.getLogger("retrieval").warning(f"LLM Query Expansion failed, falling back to original query: {e}")
+            
+        return query # Fallback gracefully if the LLM call fails    
+
     def search(
         self,
         query: str,
@@ -64,6 +98,11 @@ class KarmashriHybridRetriever:
         fetch_parent_context: bool = True
     ) -> List[Dict[str, Any]]:
         
+        query_lower = query.lower()
+        # 1. LLM-Powered Query Expansion for Sparse Search
+        sparse_query = self.expand_query_with_llm(query)  
+        clean_sparse_query = re.sub(r'[^\w\s\.-]', ' ', sparse_query).strip()
+
         # ----------------------------------------------------
         # 1. Dense Semantic Search via Qdrant
         # ----------------------------------------------------
@@ -190,7 +229,22 @@ class KarmashriHybridRetriever:
 
             for idx, base_score in enumerate(cross_scores):
                 node_id = candidates[idx][0]
-                final_ranked_ids.append((node_id, float(base_score)))
+                final_score = float(base_score) # 1. Define the score first
+
+                # ---- NEW: Soft-Filter Penalty for Forms ----
+                is_form = False
+                if node_id in sparse_rows and sparse_rows[node_id].get("section") == "statutory_form":
+                    is_form = True
+                elif node_id in dense_payloads and dense_payloads[node_id].get("section") == "statutory_form":
+                    is_form = True
+                
+                # 2. Apply the penalty to the score if it's a form and the user didn't ask for one
+                if is_form and not any(word in query_lower for word in ["form", "format", "certificate", "template", "annexure"]):
+                    final_score -= 15.0 
+                # --------------------------------------------
+                
+                # 3. Append to the final list AFTER the penalty calculation
+                final_ranked_ids.append((node_id, final_score))
             
             final_ranked_ids.sort(key=lambda x: x[1], reverse=True)
         else:
