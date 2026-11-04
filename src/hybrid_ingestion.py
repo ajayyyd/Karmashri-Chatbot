@@ -18,6 +18,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, Dict, Any, List, Optional, Tuple, Sequence
+import concurrent.futures
+import pandas as pd
+from img2table.document import Image as Img2TableImage
+from img2table.ocr import TesseractOCR
 
 import requests
 from PIL import Image
@@ -374,7 +378,7 @@ class KeralaLegalClauseParser(NodeParser):
     )
 
     FORM_HEADING: ClassVar[re.Pattern] = re.compile(
-        r'(?=(?:\n|\A)[ \t]*(?:Form|FORM)[ \t\-–—]*(?:I|II|III|IV|\d+)\b)',
+        r'(?:\n|\A)[ \t]*(?:Form|FORM|Iornr|f\s*orm)[ \t\.\-–—]*[a-zA-Z0-9\|! ]{1,10}(?=\s*\n)',
         re.IGNORECASE
     )
 
@@ -393,11 +397,13 @@ class KeralaLegalClauseParser(NodeParser):
     def detect_statutory_form(text: str, current_section: str) -> str:
         text_lower = text.lower()
         
-        # 1. Visual Artifacts (The most reliable metric in bad OCR)
-        # Look for 3 or more dots, underscores, or dashed lines
-        blank_lines_count = len(re.findall(r"\.{3,}|_{3,}|(?:-\s*){4,}", text))
+        # 1. Fill-in-the-blanks (Strictly dots and underscores, NOT dashes)
+        blank_lines_count = len(re.findall(r"\.{4,}|_{4,}", text))
         
-        # 2. Form Vocabulary Point System (Accounts for partial OCR matches)
+        # 2. Markdown Table Detection
+        has_markdown_table = "|---" in text or "| ---" in text
+        
+        # 3. Form Vocabulary Point System
         form_score = 0
         if "signature" in text_lower or "sign & seal" in text_lower: form_score += 2
         if "designation" in text_lower: form_score += 1
@@ -407,25 +413,22 @@ class KeralaLegalClauseParser(NodeParser):
         if "applicant" in text_lower: form_score += 1
         if "bill no" in text_lower or "rupees" in text_lower: form_score += 1
         
-        # 3. Explicit Title Fallbacks (If OCR actually got it right)
         has_title = False
         if "essentiality certificate" in text_lower or "application for" in text_lower:
             has_title = True
-        # Fuzzy match for Form-I, Form-II, etc.
         if re.search(r"\bform[- \w]{1,5}[ivx\d]+", text_lower):
             has_title = True
 
         # DECISION TREE
-        # Extreme blanks (4+) = Form (even if OCR completely ruined every single word)
-        if blank_lines_count >= 4:
+        if blank_lines_count >= 3:
             return "statutory_form"
             
-        # High blanks (2+) + At least one form field recognized
-        if blank_lines_count >= 2 and form_score >= 1:
+        # If it has a table AND form keywords (e.g. signature), it's a form. 
+        # If it's just a table with 0 form keywords, it stays an annexure_rule.
+        if (has_markdown_table or blank_lines_count >= 1) and form_score >= 1:
             return "statutory_form"
             
-        # Explicit Title + At least one form field or blank
-        if has_title and (blank_lines_count >= 1 or form_score >= 1):
+        if has_title and (has_markdown_table or blank_lines_count >= 1 or form_score >= 1):
             return "statutory_form"
             
         return current_section
@@ -532,7 +535,7 @@ class KeralaLegalClauseParser(NodeParser):
         meta: Dict[str, Any],
         go_id: str
     ) -> List[TextNode]:
-        """State machine that tracks parent clause ancestry."""
+        """State machine that tracks parent clause ancestry and injects context."""
         if not text:
             return []
 
@@ -553,10 +556,12 @@ class KeralaLegalClauseParser(NodeParser):
             end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
             slices.append((start, end, m))
 
-        path_stack: List[str] = []
+        # The State Machine
+        stack = {1: None, 2: None, 3: None, 4: None}
+        top_level_context = ""
 
         for start, end, match_obj in slices:
-            chunk = text[start:end]
+            chunk = text[start:end].strip()
             if not chunk:
                 continue
                 
@@ -566,25 +571,66 @@ class KeralaLegalClauseParser(NodeParser):
             if match_obj is None:
                 marker = "Intro"
                 path_str = "Intro"
+                final_chunk_text = chunk
             else:
-                if match_obj.group('num') or match_obj.group('paren_num'):
-                    val = match_obj.group('num') or match_obj.group('paren_num')
-                    path_stack = [val]
+                if match_obj.group('num'):  # Depth 1: "1."
+                    val = match_obj.group('num')
                     marker = f"{val}."
-                elif match_obj.group('alpha'):
-                    val = f"({match_obj.group('alpha')})"
-                    path_stack = path_stack[:1] + [val]
-                    marker = val
-                elif match_obj.group('roman') or match_obj.group('standalone_roman'):
-                    val = f"({match_obj.group('roman') or match_obj.group('standalone_roman')})"
-                    path_stack = path_stack[:2] + [val]
-                    marker = val
+                    
+                    # Reset deeper states
+                    stack[1] = marker
+                    stack[2], stack[3], stack[4] = None, None, None
+                    
+                    # Capture the title line for context injection
+                    top_level_context = chunk.split('\n')[0].strip()
+                    final_chunk_text = chunk
+
+                elif match_obj.group('paren_num'):  # Depth 2: "(1)"
+                    val = match_obj.group('paren_num')
+                    marker = f"({val})"
+                    
+                    stack[2] = marker
+                    stack[3], stack[4] = None, None
+                    
+                    # Inject Context
+                    if top_level_context:
+                        final_chunk_text = f"[Context: This is a sub-clause of {top_level_context}]\n\n{chunk}"
+                    else:
+                        final_chunk_text = chunk
+
+                elif match_obj.group('alpha'):  # Depth 3: "(a)"
+                    val = match_obj.group('alpha')
+                    marker = f"({val})"
+                    
+                    stack[3] = marker
+                    stack[4] = None
+                    
+                    # Inject Context
+                    if top_level_context:
+                        final_chunk_text = f"[Context: This is a sub-clause of {top_level_context}]\n\n{chunk}"
+                    else:
+                        final_chunk_text = chunk
+
+                elif match_obj.group('roman') or match_obj.group('standalone_roman'):  # Depth 4: "(i)"
+                    val = match_obj.group('roman') or match_obj.group('standalone_roman')
+                    marker = f"({val})"
+                    
+                    stack[4] = marker
+                    
+                    # Inject Context
+                    if top_level_context:
+                        final_chunk_text = f"[Context: This is a sub-clause of {top_level_context}]\n\n{chunk}"
+                    else:
+                        final_chunk_text = chunk
                 else:
                     marker = "Clause"
+                    final_chunk_text = chunk
 
-                path_str = " > ".join(path_stack) if path_stack else marker
+                # Rebuild current path dynamically based on active stack levels
+                active_levels = [stack[lvl] for lvl in range(1, 5) if stack[lvl]]
+                path_str = " > ".join(active_levels) if active_levels else marker
 
-            nodes.append(self._build_node(chunk, meta, chunk_section, marker, path_str, go_id))
+            nodes.append(self._build_node(final_chunk_text, meta, chunk_section, marker, path_str, go_id))
 
         return nodes
 
@@ -628,7 +674,9 @@ class KeralaLegalClauseParser(NodeParser):
 
 def assert_complete_text_coverage(source_text: str, nodes: List[BaseNode]) -> None:
     def strip_ws(t: str) -> str:
-        return "".join(c for c in unicodedata.normalize('NFC', t) if not c.isspace())
+        # Ignore our dynamically injected context when validating the text invariant
+        clean_t = re.sub(r'\[Context: This is a sub-clause of .*?\]', '', t)
+        return "".join(c for c in unicodedata.normalize('NFC', clean_t) if not c.isspace())
 
     src_stripped = strip_ws(source_text)
     node_stripped = "".join(strip_ws(n.text) for n in nodes)
@@ -642,32 +690,107 @@ def assert_complete_text_coverage(source_text: str, nodes: List[BaseNode]) -> No
 
 
 def extract_page_data(page: pymupdf.Page) -> Tuple[str, str]:
+    # 1. Try Digital Extraction First
     tab_finder = page.find_tables()
-    table_bboxes = []
     table_md_chunks = []
-
     if tab_finder.tables:
         for tab in tab_finder.tables:
-            table_bboxes.append(tab.bbox)
             table_md_chunks.append(tab.to_markdown())
 
-    raw_digital = page.get_text("text").strip()
+    # Extract every individual word with its exact X/Y visual coordinates
+    words = page.get_text("words")
+    lines = {}
+    
+    # Extract every individual word
+    words = page.get_text("words")
+    
+    # Sort primarily by top Y-coordinate, then left X-coordinate
+    words.sort(key=lambda w: (w[1], w[0]))
+
+    lines = []
+    current_line = []
+    current_top = -1
+    current_bottom = -1
+
+    for w in words:
+        w_x0, w_top, w_x1, w_bottom, text = w[0], w[1], w[2], w[3], w[4]
+        w_center = (w_top + w_bottom) / 2
+
+        if not current_line:
+            current_line.append((w_x0, text))
+            current_top, current_bottom = w_top, w_bottom
+        else:
+            # If the word's vertical center is within the current line's bounding box, it belongs here
+            if current_top <= w_center <= current_bottom:
+                current_line.append((w_x0, text))
+                # Expand the bounding box slightly if this word is taller
+                current_top = min(current_top, w_top)
+                current_bottom = max(current_bottom, w_bottom)
+            else:
+                # Word is outside the box. Save current line and start a new one.
+                lines.append(current_line)
+                current_line = [(w_x0, text)]
+                current_top, current_bottom = w_top, w_bottom
+
+    if current_line:
+        lines.append(current_line)
+
+    sorted_lines = []
+    for line in lines:
+        # Sort all words on this specific line horizontally (left-to-right)
+        line.sort(key=lambda x: x[0])
+        # Extract just the text and join with spaces
+        sorted_lines.append(" ".join([word_data[1] for word_data in line]))
+        
+    raw_digital = "\n".join(sorted_lines).strip()
+    
     score = SafeTextNormalizer.evaluate_quality(raw_digital)
 
     if score >= MIN_TEXT_QUALITY_SCORE:
         full_text = raw_digital + ("\n\n" + "\n\n".join(table_md_chunks) if table_md_chunks else "")
         return full_text, "digital"
 
+    # 2. Scanned Image Pipeline
     pix = page.get_pixmap(matrix=pymupdf.Matrix(ZOOM, ZOOM), colorspace=pymupdf.csGRAY)
-    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    img_bytes = pix.tobytes("png")
 
+    # STRICT DETECTOR: Prevents hallucinating tables from regular text like distribution lists
+    img_doc = Img2TableImage(img_bytes)
+    detected_tables = img_doc.extract_tables(ocr=None, implicit_rows=False, borderless_tables=False)
+
+    table_markdowns = []
+    if detected_tables:
+        log.info("Strict table grids detected. Extracting...")
+        ocr = TesseractOCR(n_threads=1, lang="eng")
+        extracted_tables = img_doc.extract_tables(ocr=ocr, implicit_rows=False, borderless_tables=False)
+        
+        for ext_table in extracted_tables:
+            if ext_table.df is not None and not ext_table.df.empty:
+                df = ext_table.df.fillna("")
+                table_markdowns.append(df.to_markdown(index=False))
+
+    # 3. Standard text extraction for the rest of the page
+    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
     raw_ocr = pytesseract.image_to_string(
         img,
-        config=f"--oem 1 --psm 3 -c tessedit_create_txt=1",
+        config="--oem 1 --psm 3 -c tessedit_create_txt=1",
         timeout=TESSERACT_TIMEOUT
     )
-    return raw_ocr, "tesseract_ocr"
 
+    # 4. Stitch text and tables together
+    full_text = raw_ocr
+    if table_markdowns:
+        full_text += "\n\n### Extracted Tables:\n\n" + "\n\n".join(table_markdowns)
+
+    return full_text, "tesseract_hybrid"
+
+
+def _process_single_page(page_num: int, pdf_path: Path) -> Tuple[int, str, str]:
+    """Isolated worker function for parallel execution."""
+    with pymupdf.open(pdf_path) as local_doc:
+        page = local_doc[page_num]
+        t, m = extract_page_data(page)
+        return page_num, t, m
 
 def ingest_kerala_go_pdf(pdf_path: Path) -> List[BaseNode]:
     if not pdf_path.exists():
@@ -677,21 +800,27 @@ def ingest_kerala_go_pdf(pdf_path: Path) -> List[BaseNode]:
     with pymupdf.open(pdf_path) as doc:
         if doc.needs_pass:
             raise PermissionError(f"PDF is encrypted: {pdf_path.name}")
+        total_pages = len(doc)
 
-        page_texts: List[str] = []
-        modes: List[str] = []
+    page_texts: List[str] = [""] * total_pages
+    modes: List[str] = [""] * total_pages
 
-        for p in doc:
-            t, m = extract_page_data(p)
-            page_texts.append(t)
-            modes.append(m)
+    # Execute OCR and Table extraction concurrently across CPU cores
+    log.info(f"Processing {total_pages} pages in parallel...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+        futures = [executor.submit(_process_single_page, i, pdf_path) for i in range(total_pages)]
+        
+        for future in concurrent.futures.as_completed(futures):
+            page_num, t, m = future.result()
+            page_texts[page_num] = t
+            modes[page_num] = m
 
-        full_text = SafeTextNormalizer.clean("\n\n".join(page_texts))
+    full_text = SafeTextNormalizer.clean("\n\n".join(page_texts))
 
-        metadata = HybridKeralaGOMetadataExtractor.extract(full_text, filename_hint=pdf_path.name)
-        metadata["source_file"] = pdf_path.name
-        metadata["total_pages"] = len(doc)
-        metadata["extraction_mode"] = "digital" if all(m == "digital" for m in modes) else "ocr_hybrid"
+    metadata = HybridKeralaGOMetadataExtractor.extract(full_text, filename_hint=pdf_path.name)
+    metadata["source_file"] = pdf_path.name
+    metadata["total_pages"] = total_pages
+    metadata["extraction_mode"] = "digital" if all(m == "digital" for m in modes) else "ocr_hybrid"
 
     parent_doc = Document(text=full_text, metadata=metadata)
     parser = KeralaLegalClauseParser()

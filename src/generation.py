@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("generation")
 
 OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL","qwen2.5:3b")
 
 
 class KarmashriLegalAdvisor:
@@ -152,7 +152,7 @@ Provide a direct, authoritative executive response formatted strictly under thes
                         "num_ctx": 4096
                     }
                 },
-                timeout=90
+                timeout=120
             )
 
             if res.status_code == 200:
